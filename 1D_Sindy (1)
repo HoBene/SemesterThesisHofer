@@ -1,0 +1,304 @@
+#needed functions, inspired by Doehner, Hearinger and Silva related to "Nonlinear flame response modelling by a
+#parsimonious set of ordinary differential equations", 2022
+import time   
+import numpy as np
+import cmath
+import math
+import h5py
+import cloudpickle as pickle
+from scipy.optimize import minimize, Bounds
+from tqdm import tqdm
+
+def undersample(inp, rate):
+    s = int(np.floor(len(inp)/rate))
+    u = np.zeros([s, 1])
+    for k in range(0, s):
+        u[k] = in[k*rate]
+    return u[:, 0]
+
+def load_data(path, u):
+    h5 = h5py.File(path, 'r')
+    inp = np.array(h5.get('U'))
+    output = np.array(h5.get('Q'))
+    ts = np.array(h5file.get('Ts'))
+    h5file.close()
+    inp = undersample(inp, u)
+    output = undersample(output, u)
+    return inp, output, ts[0]
+
+import numpy as np
+import sys; sys.path.insert(0, './flame_ode_main/examples/')
+import matplotlib.pyplot as plt
+import math
+import pysindy as ps
+from pysindy.differentiation import SmoothedFiniteDifference,SpectralDerivative,FiniteDifference
+from pysindy.feature_library import IdentityLibrary, CustomLibrary, GeneralizedLibrary
+from pysindy.feature_library import ConcatLibrary
+import tensorflow as tf
+from pysindy.optimizers import SR3,STLSQ, FROLS, SSR
+from pysindy import SINDy
+import h5py
+from pathlib import Path
+from scipy.interpolate import UnivariateSpline
+import scipy.io
+from scipy.signal import savgol_filter
+from pysindy.differentiation import finite_difference
+#specify data path 
+Data_path = ''
+File_path = 'Haeringer_Linear.h5'
+Train_test_split = 0.75
+#%%
+
+def create_model(Q_train, u_data, dt, shifted,win,simulate_index,save_index):
+ #preprocess Q and u data
+    u_tmp = u_data[1000:-1000]
+    Q = Q_train[1000:-1000]
+    print(Q.shape)
+    print(Q_train.shape)
+ 
+    window_size = win+1 # bis 1500
+    # Polynomgrad
+    polyorder = 5
+    # Berechnen Sie die vierte Ableitung mit dem Savitzky-Golay-Filter
+    Q_sav = savgol_filter(Q, window_size, polyorder, deriv=0)
+    Qd1 = savgol_filter(Q, window_size, polyorder, deriv=1)/dt ** 1
+    Qd2 = savgol_filter(Q, window_size, polyorder, deriv=2)/dt ** 2
+    Qd3 = savgol_filter(Q, window_size, polyorder, deriv=3)/dt ** 3
+    Qd4 = savgol_filter(Q, window_size, polyorder, deriv=4)/dt ** 4
+    # plot preprocessed data
+    #plt.plot(Q_sav[:], label='sindy win = '+ str(win+1))
+    #plt.plot(Q[:], label='actual')
+    #plt.xlabel("t")
+    #plt.ylabel("Q")
+    #plt.legend()
+    #plt.show()
+
+    #reshape data
+    Q = Q_sav.reshape(-1, 1)  # -1 means infer the appropriate number of rows
+    Qd1 = Qd1.reshape(-1, 1)
+    Qd2 = Qd2.reshape(-1, 1)
+    Qd3 = Qd3.reshape(-1, 1)
+    Qd4 = Qd4.reshape(-1, 1)
+    
+    
+    # concatenate data to one array
+    #use for ODE of fourth order
+    x_data= np.concatenate((Q,Qd1,Qd2,Qd3), axis=1)       
+    xdot_data=np.concatenate((Qd1,Qd2,Qd3,Qd4), axis=1)
+    #use for ODE of third order
+    #x_data = np.concatenate((Q, Qd1, Qd2), axis=1)
+    #xdot_data = np.concatenate((Qd1, Qd2, Qd3), axis=1)
+
+    u=u_tmp
+
+    # split data in train & test set
+    n_train = math.ceil(Train_test_split * x_data.shape[0])
+    #n_train_1 = math.ceil(0.75 * x_data.shape[0])
+    u_train = u[:n_train,]
+    u_test = u[n_train:-3000,]
+    x_train = x_data[:n_train,]
+    x_test = x_data[n_train:-3000,]
+    xdot_train = xdot_data[:n_train,]
+    xdot_test = xdot_data[n_train:-3000,]
+
+    # create time vector
+    t_test = np.zeros(len(x_test))
+    for i in range(0, (len(x_test))):
+        t_test[i] = (i)*dt
+    t_train = np.zeros(len(x_train))
+    for i in range(0, (len(x_train))):
+        t_train[i] = (i)*dt
+    #specify optimizer and feature names 
+    opt=STLSQ(threshold=0.01, alpha= 5,max_iter=1000,verbose=True)
+    #opt = STLSQ(threshold=0.001, alpha=0, max_iter=1000, verbose=True)
+    #opt = SSR()
+    #opt= SR3(threshold=0.5,tol=1e-10,thresholder="L1",max_iter=1000,verbose=True)
+    #feature_names = ['Q', 'Qd1', 'Qd2','F0']
+
+    poly_lib = ps.PolynomialLibrary(degree=3, interaction_only=False)
+    fou_lib = ps.FourierLibrary(n_frequencies=2)
+    
+
+     #different functions tested during implementation 
+        #lambda x: np.exp(-abs(x))*np.sin(x),]
+        #lambda x: np.cos(x),]
+        #lambda x: np.sin(0.2*x),
+        #lambda x: np.cos(0.2*x),
+        #lambda x: np.sin(0.04*x),
+        #lambda x: np.cos(0.04*x),
+        #lambda x: np.sin(0.008*x),
+        #lambda x: np.cos(0.008*x),]
+        #lambda x: np.sin(x),
+        #lambda x: np.cos(x),
+        #lambda x: np.exp(x)*np.cos(x)*x]
+        #lambda x,y: np.exp(-abs(x))*y*x,] Var A: x*y, exp(-2absx)*y sin(x)x exp(-2abs(x))*x
+        #lambda x: np.sin(x)*x,
+        #lambda x: np.exp(-x)*np.cos(5*x),]
+        #lambda x,y: np.exp(-x-y),]
+        #lambda x: x**2*np.exp(-x),]
+        #lambda x: x*np.sin(x+500),]
+        #lambda x: np.sin(100*x),]
+        #lambda x: np.sin(500*x),
+        #lambda x: np.sin(50*x),
+        #lambda x: np.cos(x),
+        #lambda x: np.sin(x),]
+        #lambda x,y: np.exp(-x*y),
+        #lambda x: x*np.exp(-x)*x*x+x*x*np.exp(-x),
+        #lambda x: np.cos(100*x),
+        #lambda x: x*x+x,
+        #lambda x: np.cos(50*x)*np.exp(-x),
+        #lambda x: np.cos(x+500),
+        #lambda x: np.exp(-x),
+        #lambda x,y: np.exp(x)*np.cos(y),]
+    # set final explicit functions 
+    functions = [lambda x: x,
+        lambda x,y: np.exp(-2*abs(x))*y,
+        #lambda x: np.exp(-2*abs(x))*np.cos(x)*x,
+        lambda x: np.exp(-2*abs(x))*x**2,]
+        #lambda x: np.sin(x)*x,] 
+    # create custom function library for explicit modeling 
+    exp_lib = CustomLibrary(library_functions=functions)
+    #final implicit functions
+    x_dot_functions = [lambda x: np.cos(x),
+                       lambda x: np.exp(-abs(x)),
+                       #lambda x: np.cos(x)*x**2*np.exp(-abs(x)),
+                       #lambda x:x**2,]
+                       #lambda x: np.cos(0.01*x)*np.exp(-abs(x)),
+                       #lambda x: np.cos(0.1*x),
+                       ]
+    # create custom library for implicit modeling 
+    sindy_lib = ps.SINDyPILibrary(library_functions=functions,x_dot_library_functions=x_dot_functions, t=dt)
+    # create polynomial and custom fourier library
+    iden_lib=ps.IdentityLibrary()
+    fou_lib = GeneralizedLibrary([fou_lib, iden_lib])
+    pf_lib = GeneralizedLibrary([exp_lib, poly_lib])
+    # initalize model 
+    model = SINDy(optimizer=opt, feature_library=sindy_lib, t_default=dt)
+    
+    print(x_train.shape)
+    print(xdot_train.shape)
+    print(u_train.shape)
+    #fit and print model 
+    model.fit(x=x_train, t=dt, x_dot=xdot_train, u=u_train)
+    model.print()
+    # model.get_feature_names()
+    print(model.score(x=x_test, t=dt, x_dot=xdot_test, u=u_test))
+    #np.linalg.norm(x_test - x_test_pred) / np.linalg.norm(x_test)
+    #get derivative predictions 
+    x_predict = model.predict(x=x_test, u=u_test)
+    print(x_predict.shape)
+    plt.plot(t_test, x_predict[:, -1], label='sindy highest diff predict win = '+ str(win+1))  #plot highest derivative
+    plt.plot(t_test, xdot_test[:, -1], label='actual highest diff')
+    # if save index set to 1, save data and predictions as csv file and save data, predictions, forcing and time as .mat to solve numerically
+    if save_index ==1:
+        grads_t=np.arange(1, (len(xdot_test)+1)) 
+        preds = np.concatenate((t_test[:, np.newaxis], x_predict), axis=1)
+        tests = np.concatenate((t_test[:, np.newaxis], xdot_test), axis=1)
+        preds = preds[::100,:]
+        tests = tests[::100,:]
+        print(tests.shape)
+        np.savetxt('./1dResults/Im_4d_predicted.csv', preds, delimiter=',')
+        np.savetxt('./1dResults/Im_4d_test.csv', tests, delimiter=',')
+        scipy.io.savemat('./2dResults/0VAE_no_lat{}_{}d_x_test.mat'.format(lat_i,n_diff), {'x_test': x_test})
+        scipy.io.savemat('./2dResults/0VAE_no_lat{}_{}d_xdot_test.mat'.format(lat_i,n_diff), {'xdot_test': xdot_test})
+        scipy.io.savemat('./2dResults/0VAE_no_lat{}_{}d_t_test.mat'.format(lat_i,n_diff), {'t_test': t_test})
+        scipy.io.savemat('./2dResults/0VAE_no_lat{}_{}d_u_test.mat'.format(lat_i,n_diff), {'u_test': u_test})
+
+    plt.legend()
+    plt.show()
+    # if simulate index = 1, simulate system and save results and actual values as csv 
+    if simulate_index == 1: 
+        print(x_test.shape)
+        print(t_test.shape)
+        print(u_test.shape)
+        #scipy.io.savemat('./1dResults/Im_3d_x_test.mat', {'x_test': x_test})
+        #scipy.io.savemat('./1dResults/Im_3d_xdot_test.mat', {'xdot_test': xdot_test})
+        #scipy.io.savemat('./1dResults/Im_3d_t_test.mat', {'t_test': t_test})
+        #scipy.io.savemat('./1dResults/Im_3d_u_test.mat', {'u_test': u_test})
+        x_test_pred = model.simulate(x_test[0, :], t_test, u=u_test, integrator="odeint")
+        plt.plot(t_test[:-1], x_test_pred[:, 0], label='sindy win = '+ str(win+1))
+        plt.plot(t_test, x_test[:, 0], label='actual')
+        preds = np.concatenate((t_test[:-1, np.newaxis], x_test_pred), axis=1)
+        tests = np.concatenate((t_test[:, np.newaxis], x_test), axis=1)
+        preds = preds[::100,:]
+        tests = tests[::100,:]
+        np.savetxt('./1dResults/Im_4d_sim.csv', preds, delimiter=',')
+        np.savetxt('./1dResults/Im_4d_sim_test.csv', tests, delimiter=',')
+        plt.xlabel("t")
+        plt.ylabel("Q")
+        plt.legend()
+        plt.show()
+ 
+
+#%%
+def main():
+    #load and preprocess data 
+    print("Linear Model")
+    lin_test_data_path = Data_path+File_path
+
+    Signal_Sampling_rate = 1
+    U_data, Q_data, dt_data = load_data(
+    path=lin_test_data_path, u_rate=Signal_Sampling_rate)
+    Q=np.transpose(Q_data)
+    U=np.transpose(U_data)
+    t=np.arange(0, len(Q)*dt_data, dt_data)
+    Qs=np.zeros((len(Q),2))
+    Us=np.zeros((len(U),2))
+    Qs[:,0]=Q[:]
+    Qs[:,1]=t[:]
+    Us[:,0]=U[:]
+    Us[:,1]=t[:]
+    Qs=Qs[::100]
+    Us=Us[::100]
+    # implement time stretch and time shift between forcing and flame response 
+    T_ref = 1/(833.34)
+    dt_nondim = Signal_Sampling_rate * dt_data / T_ref
+    time_shift = 35
+    Q_data_shifted = Q_data[time_shift:]
+    U_data_shifted = U_data[:len(Q_data_shifted)]
+    simulate_index = 1 #1 für model.simulate 
+    save_index=1       #1 to save data 
+    shifted = 0
+    i=0
+    #window_test_array =  np.arange(100, 2001, 100) set savgol filter window sizes 
+    window_test_array =[300]
+    for window_test in enumerate (window_test_array):
+        win=window_test[1]
+        print(win)
+        create_model(Q_data_shifted, U_data_shifted, dt_nondim, shifted, win, simulate_index, save_index)
+
+
+
+   ###########
+
+
+
+if __name__ == "__main__":
+   main()
+
+# %% plot actual Q and U data 
+lin_test_data_path = Data_path+File_path
+
+Signal_Sampling_rate = 1
+U_data, Q_data, dt_data = load_data(
+path=lin_test_data_path, u_rate=Signal_Sampling_rate)# %%
+
+dt=dt_data
+time = np.arange(0, len(Q_data) * dt, dt)
+plt.figure(dpi=1200)
+plt.rc('font', size=14)
+plt.plot(time,Q_data,linewidth=1)
+plt.ylabel(' Normalized intergal heat release $\dfrac{Q\'}{\overline{Q}}$ [-]')
+plt.xlabel('Time [s]')
+plt.xlim(0, 0.25)  # Set the x-axis limits
+plt.show
+
+dt=dt_data
+time = np.arange(0, len(U_data) * dt, dt)
+plt.figure(dpi=1200)
+plt.rc('font', size=14)
+plt.plot(time,U_data,linewidth=1)
+plt.ylabel(' Normalized inlet velocity $\dfrac{Q\'}{\overline{Q}}$ [-]')
+plt.xlabel('Time [s]')
+plt.xlim(0, 0.25)  # Set the x-axis limits
+plt.show
